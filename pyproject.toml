@@ -1,0 +1,10 @@
+[project]
+name = "esxi-readonly-mcp"
+version = "0.1.0"
+description = "MCP de solo lectura para VMware ESXi"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.2",
+    "pyvmomi>=8.0.1",
+    "keyring>=25",
+]
