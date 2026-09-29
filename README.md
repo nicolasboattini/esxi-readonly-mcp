@@ -1,3 +1,4 @@
+<!-- mcp-name: io.github.nicolasboattini/esxi-readonly-mcp -->
 <div align="center">
 
 # 🔍 esxi-readonly-mcp
@@ -8,6 +9,7 @@ Un servidor [MCP](https://modelcontextprotocol.io) que le da a Claude (o a cualq
 sobre tu host ESXi — CPU Ready, latencia de disco, snapshots, espacio real, salud del hardware, eventos —
 **sin una sola herramienta de escritura**.
 
+[![PyPI](https://img.shields.io/pypi/v/esxi-readonly-mcp?logo=pypi&logoColor=white)](https://pypi.org/project/esxi-readonly-mcp/)
 ![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)
 ![MCP](https://img.shields.io/badge/MCP-stdio-6E56CF)
 ![ESXi](https://img.shields.io/badge/ESXi-6.7%2B-607078?logo=vmware&logoColor=white)
@@ -102,7 +104,7 @@ mediante [`keyring`](https://pypi.org/project/keyring/). Las claves de licencia 
 
 ### Requisitos
 
-- Python 3.10 o superior y [`uv`](https://docs.astral.sh/uv/)
+- [`uv`](https://docs.astral.sh/uv/) (se encarga de Python y de las dependencias)
 - Acceso por red al puerto 443 del ESXi
 - Un cliente MCP: [Claude Code](https://docs.claude.com/en/docs/claude-code), Claude Desktop u otro
 
@@ -121,30 +123,23 @@ En el Host Client (`https://<ip-esxi>/ui`):
 > Sin *Browse datastore* el MCP funciona igual, pero `top_archivos` solo ve archivos de VMs registradas
 > (no ISOs ni huérfanos) y el espacio "usado" de discos thin es aproximado.
 
-### 2. Instalar
+### 2. Guardar la contraseña en el almacén del sistema
 
 ```bash
-git clone https://github.com/<usuario>/esxi-readonly-mcp.git
-cd esxi-readonly-mcp
-uv sync
+uvx esxi-readonly-mcp --set-password
 ```
 
-### 3. Guardar la contraseña en el almacén del sistema
+Te pide el usuario de ESXi y la contraseña (sin mostrarla) y la guarda en el almacén de credenciales del sistema.
+No hace falta clonar nada: `uvx` descarga el paquete de PyPI y lo ejecuta.
 
-```bash
-uv run python -m keyring set esxi-readonly mcp-readonly
-```
-
-Te la pide de forma interactiva, sin mostrarla. El primer argumento (`esxi-readonly`) es fijo; el segundo es el usuario de ESXi.
-
-### 4. Registrar el servidor en tu cliente MCP
+### 3. Registrar el servidor en tu cliente MCP
 
 **Claude Code**
 
 ```bash
 claude mcp add esxi-readonly --scope user \
   -e ESXI_HOST=192.0.2.10 -e ESXI_USER=mcp-readonly \
-  -- uv run --directory /ruta/a/esxi-readonly-mcp python server.py
+  -- uvx esxi-readonly-mcp
 ```
 
 **Claude Desktop u otro cliente** (en `claude_desktop_config.json` o equivalente):
@@ -153,23 +148,34 @@ claude mcp add esxi-readonly --scope user \
 {
   "mcpServers": {
     "esxi-readonly": {
-      "command": "uv",
-      "args": ["run", "--directory", "/ruta/a/esxi-readonly-mcp", "python", "server.py"],
+      "command": "uvx",
+      "args": ["esxi-readonly-mcp"],
       "env": { "ESXI_HOST": "192.0.2.10", "ESXI_USER": "mcp-readonly" }
     }
   }
 }
 ```
 
-> En Windows usá la ruta completa a `uv.exe` si el cliente no lo encuentra en el `PATH`
-> (por ejemplo `C:\\Users\\<usuario>\\.local\\bin\\uv.exe`).
+> En Windows usá la ruta completa a `uvx.exe` si el cliente no lo encuentra en el `PATH`
+> (por ejemplo `C:\\Users\\<usuario>\\.local\\bin\\uvx.exe`).
 
 Reiniciá el cliente y pedile: *"verificá los permisos del MCP de ESXi"*.
+
+### Desde el código fuente
+
+```bash
+git clone https://github.com/nicolasboattini/esxi-readonly-mcp.git
+cd esxi-readonly-mcp
+uv sync
+uv run esxi-readonly-mcp --set-password
+```
+
+Y en el cliente MCP usá `uv run --directory /ruta/a/esxi-readonly-mcp esxi-readonly-mcp` como comando.
 
 ### Probar sin cliente MCP
 
 ```bash
-ESXI_HOST=192.0.2.10 ESXI_USER=mcp-readonly uv run python -c "import server, json; print(json.dumps(server._host_info(), indent=2))"
+ESXI_HOST=192.0.2.10 ESXI_USER=mcp-readonly uv run python -c "from esxi_readonly_mcp import server; import json; print(json.dumps(server._host_info(), indent=2))"
 ```
 
 (En PowerShell: `$env:ESXI_HOST="192.0.2.10"; $env:ESXI_USER="mcp-readonly"; uv run python -c "..."`)
@@ -183,7 +189,7 @@ ESXI_HOST=192.0.2.10 ESXI_USER=mcp-readonly uv run python -c "import server, jso
 | `ESXI_PASSWORD` | | — | Solo si no podés usar `keyring` (queda en texto plano en la config: evitalo) |
 | `ESXI_PORT` | | `443` | Puerto de la API |
 | `ESXI_VERIFY_SSL` | | `0` | `1` para verificar el certificado (por defecto se acepta el autofirmado de ESXi) |
-| `ESXI_PERF_DB` | | `./perf_historial.db` | Ruta de la base SQLite del historial de performance |
+| `ESXI_PERF_DB` | | `~/.esxi-readonly-mcp/perf_historial.db` | Ruta de la base SQLite del historial de performance |
 
 ## 📈 Historial de performance
 
@@ -192,7 +198,7 @@ de las últimas semanas en horario laboral, el servidor trae un modo recolector 
 SQLite local:
 
 ```bash
-uv run python server.py --collect
+uvx esxi-readonly-mcp --collect
 ```
 
 Programalo cada hora y después pedile a Claude, por ejemplo: *"mostrame el historial de performance de las
@@ -204,8 +210,8 @@ Programalo cada hora y después pedile a Claude, por ejemplo: *"mostrame el hist
 [Environment]::SetEnvironmentVariable("ESXI_HOST", "192.0.2.10", "User")
 [Environment]::SetEnvironmentVariable("ESXI_USER", "mcp-readonly", "User")
 
-$uv = (Get-Command uv).Source
-$a  = New-ScheduledTaskAction -Execute $uv -Argument 'run --directory "C:\ruta\esxi-readonly-mcp" python server.py --collect'
+$uvx = (Get-Command uvx).Source
+$a  = New-ScheduledTaskAction -Execute $uvx -Argument 'esxi-readonly-mcp --collect'
 $t  = New-ScheduledTaskTrigger -Daily -At 7:05am
 $t.Repetition = (New-ScheduledTaskTrigger -Once -At 7:05am -RepetitionInterval (New-TimeSpan -Hours 1) -RepetitionDuration (New-TimeSpan -Hours 13)).Repetition
 Register-ScheduledTask -TaskName "ESXi perf collect" -Action $a -Trigger $t -User $env:USERNAME
@@ -214,10 +220,10 @@ Register-ScheduledTask -TaskName "ESXi perf collect" -Action $a -Trigger $t -Use
 **Linux / macOS (cron)**
 
 ```cron
-5 7-20 * * 1-5  cd /ruta/esxi-readonly-mcp && ESXI_HOST=192.0.2.10 ESXI_USER=mcp-readonly uv run python server.py --collect
+5 7-20 * * 1-5  ESXI_HOST=192.0.2.10 ESXI_USER=mcp-readonly $HOME/.local/bin/uvx esxi-readonly-mcp --collect
 ```
 
-> La base contiene nombres de VMs y métricas: está en `.gitignore` (`*.db`).
+> La base contiene nombres de VMs y métricas. Por defecto vive en tu carpeta de usuario, fuera de cualquier repo.
 
 ## 🧪 Compatibilidad
 
@@ -244,20 +250,22 @@ Register-ScheduledTask -TaskName "ESXi perf collect" -Action $a -Trigger $t -Use
 
 | Síntoma | Causa probable |
 |---|---|
-| `No hay password...` | Falta `uv run python -m keyring set esxi-readonly <usuario>` |
+| `No hay password...` | Falta `uvx esxi-readonly-mcp --set-password` |
 | `vim.fault.InvalidLogin` | Usuario o contraseña incorrectos, o el usuario no tiene permiso asignado en el host |
 | `top_archivos` avisa `NoPermission` | Al rol le falta **Datastore → Browse datastore** |
 | `performance` sin datos con `intervalo="semana"` | Normal en ESXi sin vCenter: usá `realtime` o `historial_perf` |
 | `No module named 'mcp.server.fastmcp'` | Se instaló `mcp` 2.x a mano; `uv sync` respeta `mcp<2` |
-| El cliente no encuentra `uv` | Poné la ruta absoluta a `uv` en `command` |
+| El cliente no encuentra `uvx` | Poné la ruta absoluta a `uvx` en `command` |
 | Horas raras en eventos | El reloj de ESXi está desfasado (sin NTP); `config_host` muestra el desfase y `eventos` ya lo corrige |
 
 ## 📁 Estructura
 
 ```
 esxi-readonly-mcp/
-├── server.py        # servidor MCP + modo --collect (un solo archivo, sin dependencias raras)
-├── pyproject.toml   # mcp<2, pyvmomi, keyring
+├── src/esxi_readonly_mcp/
+│   └── server.py    # servidor MCP + --collect + --set-password
+├── pyproject.toml   # paquete PyPI (mcp<2, pyvmomi, keyring)
+├── server.json      # ficha para el registro oficial de MCP
 ├── uv.lock
 └── README.md
 ```

@@ -1,0 +1,55 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.nicolasboattini/esxi-readonly-mcp",
+  "title": "ESXi Read-Only Diagnostics",
+  "description": "Read-only VMware ESXi diagnostics: CPU Ready, disk latency, snapshots, real space, hardware health.",
+  "repository": {
+    "url": "https://github.com/nicolasboattini/esxi-readonly-mcp",
+    "source": "github"
+  },
+  "version": "0.1.0",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "esxi-readonly-mcp",
+      "version": "0.1.0",
+      "runtimeHint": "uvx",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "ESXI_HOST",
+          "description": "ESXi host (or vCenter) IP or hostname",
+          "isRequired": true,
+          "format": "string"
+        },
+        {
+          "name": "ESXI_USER",
+          "description": "ESXi user with a read-only role. Store its password with 'esxi-readonly-mcp --set-password'",
+          "isRequired": true,
+          "format": "string"
+        },
+        {
+          "name": "ESXI_PASSWORD",
+          "description": "Optional: password in plain text if the OS keyring is not available (not recommended)",
+          "isRequired": false,
+          "isSecret": true,
+          "format": "string"
+        },
+        {
+          "name": "ESXI_PORT",
+          "description": "API port (default 443)",
+          "isRequired": false,
+          "format": "number"
+        },
+        {
+          "name": "ESXI_VERIFY_SSL",
+          "description": "Set to 1 to verify the TLS certificate (default 0, accepts ESXi self-signed certs)",
+          "isRequired": false,
+          "format": "string"
+        }
+      ]
+    }
+  ]
+}

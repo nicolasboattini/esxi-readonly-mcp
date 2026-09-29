@@ -11,8 +11,9 @@ No expone ninguna operacion de escritura. Los unicos metodos de la API de vSpher
 El resto son lecturas de propiedades. Igual se recomienda usar un usuario con rol Read-only en ESXi.
 
 Uso:
-  python server.py             -> servidor MCP (stdio)
-  python server.py --collect   -> guarda la ultima hora de metricas en perf_historial.db (para Task Scheduler)
+  esxi-readonly-mcp                 -> servidor MCP (stdio)
+  esxi-readonly-mcp --collect       -> guarda la ultima hora de metricas en el historial local (para cron/Task Scheduler)
+  esxi-readonly-mcp --set-password  -> guarda la password de ESXI_USER en el almacen de credenciales del sistema
 """
 import atexit
 import contextlib
@@ -31,7 +32,7 @@ logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="%(asctime)s %
 log = logging.getLogger("esxi-readonly")
 
 KEYRING_SERVICE = "esxi-readonly"
-DB_PATH = Path(os.environ.get("ESXI_PERF_DB", Path(__file__).with_name("perf_historial.db")))
+DB_PATH = Path(os.environ.get("ESXI_PERF_DB", Path.home() / ".esxi-readonly-mcp" / "perf_historial.db"))
 
 # ---------------------------------------------------------------- conexion
 
@@ -50,8 +51,8 @@ def _password() -> str:
         log.warning("keyring no disponible: %s", e)
     if not pw:
         raise RuntimeError(
-            f"No hay password. Guardala en el Administrador de credenciales de Windows con: "
-            f"uv run python -m keyring set {KEYRING_SERVICE} {os.environ.get('ESXI_USER', '<usuario>')}"
+            "No hay password. Guardala en el almacen de credenciales del sistema con: "
+            "esxi-readonly-mcp --set-password  (o: uvx esxi-readonly-mcp --set-password)"
         )
     return pw
 
@@ -586,6 +587,7 @@ def _performance(intervalo="realtime", max_muestras=180, dias=None, solo_horario
 
 
 def _db():
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(DB_PATH)
     con.execute("""CREATE TABLE IF NOT EXISTS perf (
         ts TEXT, entidad TEXT, tipo TEXT, metrica TEXT, instancia TEXT, valor REAL, unidad TEXT,
@@ -617,7 +619,7 @@ def collect():
 
 def _historial(dias=28, solo_horario_laboral=True, hora_inicio=8, hora_fin=19, entidad=None):
     if not DB_PATH.exists():
-        return {"aviso": f"No existe {DB_PATH}. Programa 'python server.py --collect' cada hora (ver README)."}
+        return {"aviso": f"No existe {DB_PATH}. Programa 'esxi-readonly-mcp --collect' cada hora (ver README)."}
     con = _db()
     desde = (_now() - dt.timedelta(days=dias)).isoformat()
     q = "SELECT ts, entidad, tipo, metrica, instancia, valor, unidad FROM perf WHERE ts >= ?"
@@ -1111,8 +1113,31 @@ def _build_mcp():
     return mcp
 
 
-if __name__ == "__main__":
+def set_password():
+    import getpass
+
+    import keyring
+
+    user = os.environ.get("ESXI_USER") or input("Usuario de ESXi: ").strip()
+    pw = getpass.getpass(f"Password de {user} (no se muestra): ")
+    if not pw:
+        sys.exit("Password vacia, no se guardo nada.")
+    keyring.set_password(KEYRING_SERVICE, user, pw)
+    print(f"Guardada en el almacen de credenciales del sistema ({KEYRING_SERVICE} / {user}).")
+
+
+def main():
     if "--collect" in sys.argv:
         collect()
+    elif "--set-password" in sys.argv:
+        set_password()
+    elif "--version" in sys.argv:
+        from importlib.metadata import version
+
+        print(version("esxi-readonly-mcp"))
     else:
         _build_mcp().run()
+
+
+if __name__ == "__main__":
+    main()

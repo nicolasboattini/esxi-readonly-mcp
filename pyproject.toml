@@ -1,10 +1,38 @@
-﻿[project]
+[project]
 name = "esxi-readonly-mcp"
 version = "0.1.0"
-description = "MCP de solo lectura para VMware ESXi"
+description = "Read-only MCP server for VMware ESXi: CPU Ready, disk latency, snapshots, real space usage, hardware health and events"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Nicolas Boattini" }]
 requires-python = ">=3.10"
+keywords = ["mcp", "mcp-server", "model-context-protocol", "vmware", "esxi", "vsphere", "claude", "read-only"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: System Administrators",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Monitoring",
+    "Topic :: System :: Systems Administration",
+]
 dependencies = [
     "mcp>=1.2,<2",
     "pyvmomi>=8.0.1",
     "keyring>=25",
 ]
+
+[project.urls]
+Homepage = "https://github.com/nicolasboattini/esxi-readonly-mcp"
+Repository = "https://github.com/nicolasboattini/esxi-readonly-mcp"
+Issues = "https://github.com/nicolasboattini/esxi-readonly-mcp/issues"
+
+[project.scripts]
+esxi-readonly-mcp = "esxi_readonly_mcp.server:main"
+
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/esxi_readonly_mcp"]
