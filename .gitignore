@@ -218,3 +218,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Historial local de performance (contiene nombres de VMs y metricas)
+*.db
