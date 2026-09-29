@@ -4,7 +4,10 @@ No expone ninguna operacion de escritura. Los unicos metodos de la API de vSpher
   CreateContainerView / ContainerView.Destroy  (vista temporal de la propia sesion, para listar objetos)
   PerformanceManager.QueryPerf / QueryAvailablePerfMetric / QueryPerfProviderSummary
   HostDatastoreBrowser.SearchDatastoreSubFolders_Task  (listar archivos; requiere Datastore.Browse)
-  AuthorizationManager.HasPrivilegeOnEntity  (verificar permisos del usuario)
+  AuthorizationManager.HasPrivilegeOnEntity / RetrieveEntityPermissions  (verificar permisos del usuario)
+  EventManager.QueryEvents / CreateCollectorForEvents (+ Reset/ReadNext/Destroy del colector propio), CurrentTime
+  HostImageConfigManager.FetchSoftwarePackages / HostImageConfigGetProfile / HostImageConfigGetAcceptance
+  OptionManager.QueryOptions  (leer opciones avanzadas)
 El resto son lecturas de propiedades. Igual se recomienda usar un usuario con rol Read-only en ESXi.
 
 Uso:
@@ -12,6 +15,7 @@ Uso:
   python server.py --collect   -> guarda la ultima hora de metricas en perf_historial.db (para Task Scheduler)
 """
 import atexit
+import contextlib
 import datetime as dt
 import logging
 import os
@@ -21,7 +25,7 @@ import time
 from pathlib import Path
 
 from pyVim.connect import Disconnect, SmartConnect
-from pyVmomi import vim, vmodl
+from pyVmomi import VmomiSupport, vim, vmodl
 
 logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("esxi-readonly")
@@ -130,8 +134,21 @@ def _files_by_key(vm):
     return {f.key: f for f in (lex.file if lex else [])}
 
 
-def _unit_size(unit, files):
-    return sum((files[k].size or 0) for k in unit.fileKey if k in files)
+_VMDK_EXTENTS = ("-flat.vmdk", "-delta.vmdk", "-sesparse.vmdk")
+
+
+def _file_size(name, size, real):
+    """Tamano real de un archivo segun el datastore browser; layoutEx no es confiable para discos thin.
+    El browser agrupa descriptor + extent (-flat/-delta/-sesparse) bajo el .vmdk del descriptor."""
+    if real is None:
+        return size or 0
+    if name.lower().endswith(_VMDK_EXTENTS):
+        return 0
+    return real.get(name, size or 0)
+
+
+def _unit_size(unit, files, real=None):
+    return sum(_file_size(files[k].name, files[k].size, real) for k in unit.fileKey if k in files)
 
 
 # ---------------------------------------------------------------- 1. host
@@ -236,7 +253,7 @@ def _datastores():
 # ---------------------------------------------------------------- 3. VMs
 
 
-def _vm_disks(vm):
+def _vm_disks(vm, real=None):
     c = vm.config
     files = _files_by_key(vm)
     chains = {d.key: d.chain for d in (vm.layoutEx.disk if vm.layoutEx else [])}
@@ -256,8 +273,8 @@ def _vm_disks(vm):
         else:
             tipo = "thick lazy zeroed"
         chain = chains.get(d.key, [])
-        base = _unit_size(chain[0], files) if chain else None
-        total = sum(_unit_size(u, files) for u in chain) if chain else None
+        base = _unit_size(chain[0], files, real) if chain else None
+        total = sum(_unit_size(u, files, real) for u in chain) if chain else None
         out.append({
             "etiqueta": d.deviceInfo.label,
             "archivo": b.fileName,
@@ -272,7 +289,19 @@ def _vm_disks(vm):
     return out
 
 
+def _vm_uso_por_datastore(vm, real):
+    agg = {}
+    for f in (vm.layoutEx.file if vm.layoutEx else []):
+        ds = f.name[1:].split("]", 1)[0]
+        t = {"diskDescriptor": "discos", "diskExtent": "discos", "swap": "swap",
+             "snapshotData": "snapshots", "snapshotMemory": "snapshots"}.get(f.type, "otros")
+        a = agg.setdefault(ds, {"discos": 0, "swap": 0, "snapshots": 0, "otros": 0})
+        a[t] += _file_size(f.name, f.size, real)
+    return {ds: {**{k: gb(v) for k, v in a.items()}, "total_gb": gb(sum(a.values()))} for ds, a in agg.items()}
+
+
 def _vms():
+    real, fuente = _real_sizes()
     out = []
     for vm in _objs(vim.VirtualMachine):
         c, s = vm.config, vm.summary
@@ -281,6 +310,7 @@ def _vms():
             out.append({"nombre": s.config.name, "estado": str(s.runtime.powerState), "error": "config inaccesible"})
             continue
         g = vm.guest
+        uso_ds = _vm_uso_por_datastore(vm, real)
         out.append({
             "nombre": vm.name,
             "estado": str(vm.runtime.powerState),
@@ -306,13 +336,24 @@ def _vms():
             "tools_estado": g.toolsRunningStatus,
             "tools_version_estado": g.toolsVersionStatus2,
             "tools_version": g.toolsVersion,
+            "heartbeat": str(vm.guestHeartbeatStatus),
+            "sync_hora_con_host": _try(lambda: c.tools.syncTimeWithHost),
+            "firmware": c.firmware,
             "ip": g.ipAddress,
             "hostname_guest": g.hostName,
-            "storage_usado_gb": gb(s.storage.committed) if s.storage else None,
-            "storage_provisionado_gb": gb((s.storage.committed + s.storage.uncommitted)) if s.storage else None,
+            "nics": [{
+                "etiqueta": d.deviceInfo.label,
+                "tipo": type(d).__name__.split(".")[-1],
+                "red": _try(lambda: d.backing.deviceName),
+                "conectada": _try(lambda: d.connectable.connected),
+                "mac": d.macAddress,
+            } for d in c.hardware.device if isinstance(d, vim.vm.device.VirtualEthernetCard)],
+            "storage_usado_gb": round(sum(v["total_gb"] or 0 for v in uso_ds.values()), 2),
+            "storage_usado_por_datastore": uso_ds,
+            "storage_fuente": fuente,
             "necesita_consolidar": vm.runtime.consolidationNeeded,
             "tiene_snapshots": vm.snapshot is not None,
-            "discos": _vm_disks(vm),
+            "discos": _vm_disks(vm, real),
             "discos_guest": [
                 {"unidad": d.diskPath, "capacidad_gb": gb(d.capacity), "libre_gb": gb(d.freeSpace),
                  "uso_pct": round(100 * (d.capacity - d.freeSpace) / d.capacity, 1) if d.capacity else None}
@@ -334,9 +375,9 @@ def _walk(tree, parent=None):
 def _snapshots(dias_alerta=3):
     now = _now()
     out = []
-    for vm in _objs(vim.VirtualMachine):
-        if not vm.snapshot:
-            continue
+    vms = [vm for vm in _objs(vim.VirtualMachine) if vm.snapshot]
+    real = _real_sizes()[0] if vms else None
+    for vm in vms:
         files = _files_by_key(vm)
         lex = vm.layoutEx
         snap_layout = {_moid(sl.key): sl for sl in (lex.snapshot if lex else [])}
@@ -354,14 +395,14 @@ def _snapshots(dias_alerta=3):
             if sl:
                 for k in (sl.dataKey, sl.memoryKey):
                     if k is not None and k >= 0 and k in files:
-                        size += files[k].size or 0
+                        size += _file_size(files[k].name, files[k].size, real)
                 # delta de cada disco: el eslabon siguiente a la cadena del snapshot
                 for d in sl.disk or []:
                     my = [tuple(u.fileKey) for u in d.chain]
                     for ch in chains.get(d.key, []):
                         keys = [tuple(u.fileKey) for u in ch]
                         if len(keys) > len(my) and keys[: len(my)] == my:
-                            size += _unit_size(ch[len(my)], files)
+                            size += _unit_size(ch[len(my)], files, real)
                             break
             edad = (now - n.createTime).total_seconds() / 86400
             out.append({
@@ -617,6 +658,35 @@ def _wait(task, timeout=600):
     return task.info.result
 
 
+def _browse(ds):
+    """[(ruta, bytes, modificado)] de todos los archivos del datastore. Requiere Datastore.Browse."""
+    spec = vim.host.DatastoreBrowser.SearchSpec(
+        details=vim.host.DatastoreBrowser.FileInfo.Details(
+            fileSize=True, modification=True, fileType=True, fileOwner=False),
+        sortFoldersFirst=True)
+    result = _wait(ds.browser.SearchDatastoreSubFolders_Task(datastorePath=f"[{ds.name}]", searchSpec=spec))
+    out = []
+    for r in result or []:
+        folder = r.folderPath if r.folderPath.endswith(("/", "]")) else r.folderPath + "/"
+        if folder.endswith("]"):
+            folder += " "
+        for f in r.file or []:
+            if not isinstance(f, vim.host.DatastoreBrowser.FolderInfo):
+                out.append((folder + f.path, f.fileSize, f.modification))
+    return out
+
+
+def _real_sizes():
+    """({ruta: bytes}, fuente). Si no se puede recorrer algun datastore, cae a layoutEx (aproximado)."""
+    real = {}
+    try:
+        for ds in _objs(vim.Datastore):
+            real.update({p: sz for p, sz, _ in _browse(ds)})
+    except vmodl.MethodFault as e:
+        return None, f"layoutEx (aprox., sin Datastore.Browse: {type(e).__name__})"
+    return real, "datastore browser (tamano real en disco)"
+
+
 def _top_archivos(datastore=None, top=15):
     vm_files = {}
     for vm in _objs(vim.VirtualMachine):
@@ -629,22 +699,10 @@ def _top_archivos(datastore=None, top=15):
         prefix = f"[{ds.name}]"
         files, fuente, error = [], "browser", None
         try:
-            spec = vim.host.DatastoreBrowser.SearchSpec(
-                details=vim.host.DatastoreBrowser.FileInfo.Details(
-                    fileSize=True, modification=True, fileType=True, fileOwner=False),
-                sortFoldersFirst=True)
-            result = _wait(ds.browser.SearchDatastoreSubFolders_Task(datastorePath=prefix, searchSpec=spec))
-            for r in result or []:
-                folder = r.folderPath if r.folderPath.endswith(("/", "]")) else r.folderPath + "/"
-                if folder.endswith("]"):
-                    folder += " "
-                for f in r.file or []:
-                    if isinstance(f, vim.host.DatastoreBrowser.FolderInfo):
-                        continue
-                    path = folder + f.path
-                    owner = vm_files.get(path, (None,))[0]
-                    files.append({"archivo": path, "gb": gb(f.fileSize), "modificado": _iso(f.modification),
-                                  "vm": owner, "posible_huerfano": owner is None and not path.endswith(".iso")})
+            for path, size, mod in _browse(ds):
+                owner = vm_files.get(path, (None,))[0]
+                files.append({"archivo": path, "gb": gb(size), "modificado": _iso(mod), "vm": owner,
+                              "posible_huerfano": owner is None and path.lower().endswith((".vmdk", ".vswp", ".vmem", ".vmsn"))})
         except vmodl.MethodFault as e:
             error = type(e).__name__
             fuente = "layoutEx (solo archivos de VMs registradas)"
@@ -689,6 +747,221 @@ def _overcommit():
     }
 
 
+# ---------------------------------------------------------------- 8. salud de hardware
+
+
+def _salud_hardware():
+    out = []
+    for h in _objs(vim.HostSystem):
+        hs = h.runtime.healthSystemRuntime
+        if hs is None:
+            out.append({"host": h.name, "aviso": "ESXi no expone datos de salud (faltan proveedores CIM del fabricante)."})
+            continue
+        sensores = []
+        for s in (hs.systemHealthInfo.numericSensorInfo if hs.systemHealthInfo else None) or []:
+            val = s.currentReading * (10 ** s.unitModifier) if s.currentReading is not None else None
+            sensores.append({"sensor": s.name, "tipo": s.sensorType, "estado": _try(lambda: s.healthState.key),
+                             "valor": round(val, 2) if val is not None else None, "unidad": s.baseUnits})
+        hw = hs.hardwareStatusInfo
+
+        def elems(lista):
+            return [{"elemento": e.name, "estado": _try(lambda: e.status.key.lower())} for e in (lista or [])]
+
+        storage = [{"elemento": e.name, "estado": _try(lambda: e.status.key.lower()),
+                    "detalle": {o.property: o.value for o in (getattr(e, "operationalInfo", None) or [])} or None}
+                   for e in ((hw.storageStatusInfo if hw else None) or [])]
+        memoria = elems(hw.memoryStatusInfo if hw else None)
+        cpu = elems(hw.cpuStatusInfo if hw else None)
+        todos = sensores + storage + memoria + cpu
+        estados = {}
+        for x in todos:
+            estados[x["estado"]] = estados.get(x["estado"], 0) + 1
+        out.append({
+            "host": h.name,
+            "estado_general": str(h.overallStatus),
+            "resumen_estados": estados,
+            "problemas": [x for x in todos if x["estado"] not in ("green", "unknown", None)],
+            "storage_raid_y_discos": storage,
+            "sensores": sensores,
+            "memoria": memoria,
+            "cpu": cpu,
+            "nota": "green = ok, yellow = advertencia, red = falla. El estado de la RAID y de cada disco depende "
+                    "de que ESXi tenga el proveedor CIM de Dell/LSI; si storage viene vacio, verlo en iDRAC.",
+        })
+    return out
+
+
+# ---------------------------------------------------------------- 9. eventos
+
+
+def _nivel_evento(e, tipo):
+    sev = (getattr(e, "severity", None) or "").lower()
+    low = tipo.lower()
+    if isinstance(e, vim.event.AlarmStatusChangedEvent):
+        return {"red": "error", "yellow": "warning"}.get(e.to, "info")
+    if sev == "error" or any(w in low for w in ("error", "failed", "lost", "fault")):
+        return "error"
+    if sev == "warning" or any(w in low for w in ("warning", "degraded", "problem", "badusername")):
+        return "warning"
+    return "info"
+
+
+@contextlib.contextmanager
+def _tolerar_mo_genericos():
+    """ESXi 6.7 manda algunas referencias (ej. ha-folder-root) como ManagedObject generico y pyVmomi 9 las rechaza
+    al deserializar eventos. Solo mientras se leen eventos, se aceptan en lugar de abortar toda la lectura."""
+    orig = VmomiSupport.CheckField
+
+    def check(info, val):
+        try:
+            orig(info, val)
+        except TypeError:
+            if not isinstance(val, VmomiSupport.ManagedObject):
+                raise
+
+    VmomiSupport.CheckField = check
+    try:
+        yield
+    finally:
+        VmomiSupport.CheckField = orig
+
+
+def _eventos(dias=7, nivel="todos", incluir_sesiones=False, max_eventos=300):
+    s = si()
+    fin = s.CurrentTime()
+    desfase = fin - _now()
+    desde = fin - dt.timedelta(days=dias)
+    em = s.content.eventManager
+    if s.content.about.apiType == "VirtualCenter":
+        spec = vim.event.EventFilterSpec(time=vim.event.EventFilterSpec.ByTime(beginTime=desde, endTime=fin))
+        with _tolerar_mo_genericos():
+            evs = em.QueryEvents(filter=spec) or []
+    else:
+        # ESXi standalone no implementa QueryEvents: colector temporal de la sesion (se destruye al terminar)
+        col = em.CreateCollectorForEvents(filter=vim.event.EventFilterSpec())
+        try:
+            with _tolerar_mo_genericos():
+                evs = list(col.latestPage or [])
+                col.ResetCollector()  # se posiciona justo antes de latestPage; leer hacia atras
+                while True:
+                    page = col.ReadPreviousEvents(maxCount=500) or []
+                    if not page:
+                        break
+                    evs.extend(page)
+                    if min(e.createdTime for e in page) < desde:
+                        break
+        finally:
+            col.DestroyCollector()
+        vistos = set()
+        evs = [e for e in evs if e.createdTime >= desde and not (e.key in vistos or vistos.add(e.key))]
+    orden = {"info": 0, "warning": 1, "error": 2}
+    minimo = {"todos": 0, "warning": 1, "error": 2}[nivel]
+    rows, resumen = [], {}
+    for e in evs:
+        tipo = getattr(e, "eventTypeId", None) or type(e).__name__.split(".")[-1]
+        if not incluir_sesiones and tipo in ("UserLoginSessionEvent", "UserLogoutSessionEvent"):
+            continue
+        niv = _nivel_evento(e, tipo)
+        resumen[f"{niv} | {tipo}"] = resumen.get(f"{niv} | {tipo}", 0) + 1
+        if orden[niv] < minimo:
+            continue
+        rows.append({
+            "fecha": _iso(e.createdTime - desfase),
+            "nivel": niv,
+            "tipo": tipo,
+            "mensaje": e.fullFormattedMessage,
+            "vm": _try(lambda: e.vm.name),
+            "usuario": e.userName or None,
+        })
+    rows.sort(key=lambda r: r["fecha"], reverse=True)
+    return {
+        "dias": dias,
+        "desfase_reloj_esxi_min": round(desfase.total_seconds() / 60, 1),
+        "total_eventos_leidos": len(evs),
+        "limite_api_alcanzado": len(evs) >= 1000,
+        "resumen_por_tipo": dict(sorted(resumen.items(), key=lambda x: (-orden[x[0].split(" |")[0]], -x[1]))),
+        "eventos": rows[:max_eventos],
+        "nota": "Fechas corregidas por el desfase del reloj de ESXi. ESXi standalone guarda una cantidad limitada "
+                "de eventos (se pierden al reiniciar si no hay syslog persistente).",
+    }
+
+
+# ---------------------------------------------------------------- 10. configuracion del host
+
+
+def _mask(key):
+    return f"*****-{key[-5:]}" if key and len(key) > 5 else key
+
+
+def _config_host():
+    s = si()
+    c = s.content
+    desfase = (s.CurrentTime() - _now()).total_seconds() / 60
+    licencias = []
+    for l in _try(lambda: c.licenseManager.licenses, []) or []:
+        props = {p.key: p.value for p in (l.properties or []) if isinstance(p.value, (str, int, float, dt.datetime))}
+        licencias.append({
+            "nombre": l.name, "edicion": l.editionKey, "clave": _mask(l.licenseKey),
+            "total": l.total, "usado": l.used, "unidad": l.costUnit,
+            "vence": _iso(props["expirationDate"]) if isinstance(props.get("expirationDate"), dt.datetime) else None,
+            "horas_restantes": props.get("expirationHours"),
+        })
+    out = []
+    for h in _objs(vim.HostSystem):
+        cfg = h.config
+        icm = h.configManager.imageConfigManager
+        try:
+            paquetes = icm.FetchSoftwarePackages()
+        except vmodl.MethodFault as e:
+            paquetes = None
+            vibs = {"aviso": f"No disponible ({type(e).__name__} {getattr(e, 'privilegeId', '')}). Requiere "
+                             "Host.Config.Image, que tambien permite modificar la imagen: no se recomienda darlo. "
+                             "Alternativa: 'esxcli software vib list' por SSH con un admin."}
+        if paquetes is not None:
+            terceros = [{"nombre": p.name, "version": p.version, "vendor": p.vendor, "descripcion": p.summary}
+                        for p in paquetes if (p.vendor or "").lower() not in ("vmware", "vmw")]
+            vibs = {"total": len(paquetes), "vmware": len(paquetes) - len(terceros),
+                    "terceros": sorted(terceros, key=lambda x: x["nombre"])}
+        perfil = _try(lambda: icm.HostImageConfigGetProfile())
+        adv = {}
+        for k in ("Syslog.global.logHost", "Syslog.global.logDir", "UserVars.SuppressShellWarning"):
+            v = _try(lambda: h.configManager.advancedOption.QueryOptions(name=k))
+            adv[k] = v[0].value if v else None
+        servicios = [{"servicio": x.key, "nombre": x.label, "corriendo": x.running, "politica": x.policy}
+                     for x in (_try(lambda: cfg.service.service, []) or [])]
+        net = cfg.network
+        out.append({
+            "host": h.name,
+            "reloj": {
+                "desfase_min": round(desfase, 1),
+                "ntp_servidores": _try(lambda: list(cfg.dateTimeInfo.ntpConfig.server or [])),
+                "ntp_corriendo": next((x["corriendo"] for x in servicios if x["servicio"] == "ntpd"), None),
+                "zona_horaria": _try(lambda: cfg.dateTimeInfo.timeZone.name),
+            },
+            "ssh_activo": next((x["corriendo"] for x in servicios if x["servicio"] == "TSM-SSH"), None),
+            "shell_activo": next((x["corriendo"] for x in servicios if x["servicio"] == "TSM"), None),
+            "servicios_corriendo": [x for x in servicios if x["corriendo"]],
+            "perfil_imagen": _try(lambda: f"{perfil.name} ({perfil.vendor})") if perfil else None,
+            "nivel_aceptacion_vibs": _try(lambda: icm.HostImageConfigGetAcceptance()),
+            "vibs": vibs,
+            "opciones": adv,
+            "placas_red": [{
+                "nic": p.device, "driver": p.driver, "mac": p.mac,
+                "velocidad_mb": p.linkSpeed.speedMb if p.linkSpeed else None,
+                "full_duplex": p.linkSpeed.duplex if p.linkSpeed else None,
+                "estado": "conectada" if p.linkSpeed else "SIN ENLACE",
+            } for p in (net.pnic or [])],
+            "vswitches": [{"nombre": v.name, "nics": [k.split("-")[-1] for k in (v.pnic or [])], "mtu": v.mtu,
+                           "portgroups": [pg.split("-", 2)[-1] for pg in (v.portgroup or [])]}
+                          for v in (net.vswitch or [])],
+            "portgroups": [{"nombre": pg.spec.name, "vlan": pg.spec.vlanId, "vswitch": pg.spec.vswitchName}
+                           for pg in (net.portgroup or [])],
+            "vmkernel": [{"vmk": v.device, "ip": v.spec.ip.ipAddress, "portgroup": v.portgroup}
+                         for v in (net.vnic or [])],
+        })
+    return {"licencias": licencias, "hosts": out}
+
+
 # ---------------------------------------------------------------- permisos
 
 ESCRITURA = [
@@ -703,14 +976,29 @@ def _permisos():
     c = si().content
     sess = c.sessionManager.currentSession
     privs = ESCRITURA + LECTURA
+    am = c.authorizationManager
+    roles = []
     try:
-        vals = c.authorizationManager.HasPrivilegeOnEntity(entity=c.rootFolder, sessionId=sess.key, privId=privs)
-    except vmodl.MethodFault as e:
-        return {"usuario": sess.userName, "error": f"No se pudieron consultar permisos: {type(e).__name__}"}
-    tiene = dict(zip(privs, vals))
+        vals = am.HasPrivilegeOnEntity(entity=c.rootFolder, sessionId=sess.key, privId=privs)
+        tiene = dict(zip(privs, vals))
+    except vmodl.MethodFault:
+        # ESXi standalone no soporta HasPrivilegeOnEntity: leer los roles asignados al usuario
+        try:
+            by_id = {r.roleId: r for r in am.roleList}
+            mios = set()
+            yo = sess.userName.split("\\")[-1].lower()
+            for p in am.RetrieveEntityPermissions(entity=c.rootFolder, inherited=True) or []:
+                if p.principal.split("\\")[-1].lower() == yo and p.roleId in by_id:
+                    r = by_id[p.roleId]
+                    roles.append(r.info.label or r.name)
+                    mios.update(r.privilege or [])
+        except vmodl.MethodFault as e:
+            return {"usuario": sess.userName, "error": f"No se pudieron consultar permisos: {type(e).__name__}"}
+        tiene = {p: p in mios for p in privs}
     escritura = [p for p in ESCRITURA if tiene[p]]
     return {
         "usuario": sess.userName,
+        "roles": roles or None,
         "privilegios_lectura": {p: tiene[p] for p in LECTURA},
         "privilegios_escritura_detectados": escritura,
         "solo_lectura_garantizado_por_ESXi": not escritura,
@@ -786,12 +1074,34 @@ def _build_mcp():
         return _overcommit()
 
     @mcp.tool()
+    def salud_hardware() -> list:
+        """Salud del hardware segun ESXi: estado de la RAID y discos fisicos (PERC), sensores de temperatura,
+        ventiladores, fuentes, memoria y CPU. Lista primero los elementos que no estan en verde."""
+        return _salud_hardware()
+
+    @mcp.tool()
+    def eventos(dias: int = 7, nivel: str = "todos", incluir_sesiones: bool = False, max_eventos: int = 300) -> dict:
+        """Eventos de ESXi (errores de disco, reinicios de VMs, alarmas, tareas, logins fallidos).
+        nivel: todos | warning (warning y error) | error. Fechas corregidas por el desfase del reloj de ESXi."""
+        return _eventos(dias, nivel, incluir_sesiones, max_eventos)
+
+    @mcp.tool()
+    def config_host() -> dict:
+        """Configuracion del host: licencia (clave enmascarada) y vencimiento, NTP y desfase del reloj, SSH/Shell,
+        servicios activos, perfil de imagen y VIBs/drivers de terceros, syslog, placas de red (velocidad de enlace),
+        vSwitches, portgroups y VMkernel."""
+        return _config_host()
+
+    @mcp.tool()
     def diagnostico_completo(dias_alerta_snapshot: int = 3) -> dict:
-        """Ejecuta todo junto: host, datastores, VMs, snapshots, performance realtime, top archivos, overcommit y permisos."""
+        """Ejecuta todo junto: permisos, host, salud de hardware, configuracion, datastores, VMs, snapshots,
+        performance realtime, eventos (warning/error 7 dias), top archivos y overcommit."""
         out = {}
-        for k, fn in [("permisos", _permisos), ("host", _host_info), ("datastores", _datastores), ("vms", _vms),
+        for k, fn in [("permisos", _permisos), ("host", _host_info), ("salud_hardware", _salud_hardware),
+                      ("config_host", _config_host), ("datastores", _datastores), ("vms", _vms),
                       ("snapshots", lambda: _snapshots(dias_alerta_snapshot)), ("performance_1h", _performance),
-                      ("historial_local", _historial), ("top_archivos", _top_archivos), ("overcommit", _overcommit)]:
+                      ("historial_local", _historial), ("eventos", lambda: _eventos(7, "warning")),
+                      ("top_archivos", _top_archivos), ("overcommit", _overcommit)]:
             try:
                 out[k] = fn()
             except Exception as e:  # noqa: BLE001
