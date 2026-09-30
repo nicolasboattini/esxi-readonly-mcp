@@ -282,6 +282,16 @@ Issues y pull requests bienvenidos, sobre todo:
 La regla del proyecto es una sola: **ninguna herramienta puede modificar el entorno.** Un PR que agregue
 operaciones de escritura no se va a aceptar, aunque sea "opcional".
 
+### Publicar una versión (mantenedores)
+
+1. Actualizar la versión en `pyproject.toml` y en `server.json` (dos lugares: `version` y `packages[0].version`).
+2. Commit, push y tag:
+   ```bash
+   git tag v0.1.1 && git push origin v0.1.1
+   ```
+3. El workflow [`release.yml`](.github/workflows/release.yml) verifica que las versiones coincidan, compila, prueba el
+   paquete, lo publica en PyPI y después en el registro oficial de MCP. Sin tokens: usa OIDC de GitHub.
+
 ## 📄 Licencia
 
 [MIT](LICENSE)

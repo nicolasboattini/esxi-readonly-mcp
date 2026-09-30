@@ -1,0 +1,110 @@
+# Publica una version nueva en PyPI y en el registro oficial de MCP.
+#
+# Se dispara al pushear un tag vX.Y.Z (por ejemplo: git tag v0.1.1 && git push origin v0.1.1).
+# Antes de crear el tag, la version tiene que estar actualizada en pyproject.toml y en server.json (2 lugares).
+#
+# No usa tokens guardados: PyPI y el registro de MCP autentican al workflow con OIDC de GitHub.
+# Configuracion unica en PyPI: Trusted Publisher con owner nicolasboattini, repo esxi-readonly-mcp,
+# workflow release.yml y environment pypi.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build y verificacion
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: false
+
+      - name: Verificar que la version coincida en tag, pyproject.toml y server.json
+        run: |
+          python3 - <<'EOF'
+          import json, os, sys, tomllib
+          tag = os.environ["GITHUB_REF_NAME"].removeprefix("v")
+          py = tomllib.load(open("pyproject.toml", "rb"))["project"]["version"]
+          sj = json.load(open("server.json"))
+          versiones = {"tag": tag, "pyproject.toml": py, "server.json version": sj["version"]}
+          versiones.update({f"server.json packages[{i}].version": p["version"] for i, p in enumerate(sj["packages"])})
+          for k, v in versiones.items():
+              print(f"{k:32} {v}")
+          if len(set(versiones.values())) != 1:
+              sys.exit("ERROR: las versiones no coinciden. Actualiza pyproject.toml y server.json antes de crear el tag.")
+          EOF
+
+      - name: Build
+        run: uv build
+
+      - name: Smoke test del wheel
+        run: uvx --from dist/*.whl esxi-readonly-mcp --version
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  pypi:
+    name: Publicar en PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/esxi-readonly-mcp/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: false
+
+      - name: Publicar
+        run: uv publish --trusted-publishing always
+
+  mcp-registry:
+    name: Publicar en el registro de MCP
+    needs: pypi
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Esperar a que la version este disponible en PyPI
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          for i in $(seq 1 30); do
+            if curl -fsS "https://pypi.org/pypi/esxi-readonly-mcp/${VERSION}/json" > /dev/null; then
+              echo "esxi-readonly-mcp ${VERSION} disponible en PyPI"
+              exit 0
+            fi
+            echo "Todavia no aparece en PyPI (intento $i/30), esperando 10 s..."
+            sleep 10
+          done
+          echo "La version no aparecio en PyPI a tiempo" >&2
+          exit 1
+
+      - name: Instalar mcp-publisher
+        run: |
+          curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz mcp-publisher
+
+      - name: Autenticar con GitHub OIDC
+        run: ./mcp-publisher login github-oidc
+
+      - name: Publicar
+        run: ./mcp-publisher publish
