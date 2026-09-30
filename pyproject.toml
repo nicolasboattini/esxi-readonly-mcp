@@ -1,6 +1,6 @@
 [project]
 name = "esxi-readonly-mcp"
-version = "0.1.0"
+version = "0.1.1"
 description = "Read-only MCP server for VMware ESXi: CPU Ready, disk latency, snapshots, real space usage, hardware health and events"
 readme = "README.md"
 license = "MIT"
