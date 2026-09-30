@@ -16,6 +16,8 @@ sobre tu host ESXi — CPU Ready, latencia de disco, snapshots, espacio real, sa
 ![Solo lectura](https://img.shields.io/badge/modo-solo%20lectura-2EA44F)
 ![Licencia](https://img.shields.io/badge/licencia-MIT-blue)
 
+[![Listed on mcpservers.org](https://mcpservers.org/badge.svg)](https://mcpservers.org/servers/nicolasboattini/esxi-readonly-mcp)
+
 </div>
 
 ---
